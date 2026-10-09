@@ -1,0 +1,6 @@
+{
+  "asset": "studio-preview.webp",
+  "tool": "Built-in image_gen tool",
+  "prompt": "Use case: photorealistic-natural. Asset type: a sample Instagram post and story photo inside a small web app demonstration. A quiet independent ceramics studio in warm afternoon light: a wooden work table with a few handmade olive green ceramic cups, a cream vase, clay tools and subtle linen, pale plaster walls, a tall arched window with soft leafy shadows. Editorial lifestyle photograph, natural grain and real texture, understated colors, no people. Portrait 3:4 composition, recognizable central objects that also work cropped square. No text, no logos, no UI, no watermarks. Save the generated image for use in the local project.",
+  "delivery": "Resized to 640px wide and compressed as WebP, quality 82."
+}
