@@ -5,7 +5,7 @@
 
 A private Instagram inbox with automatic replies for **DMs, comments, and stories**. One Business or Creator account per installation. Others need their own deployment, Meta app, and credentials.
 
-**Hosting:** Vercel runs the app and backend; Neon stores data. The included five-minute recovery job requires **Vercel Pro** ([cron limits](https://vercel.com/docs/cron-jobs/usage-and-pricing)).
+**Free setup:** Vercel Hobby runs the app and backend; Neon Free stores data; cron-job.org recovers queued replies. No separate backend server or Vercel Pro needed. Stay within the providers' free quotas. [Vercel Hobby](https://vercel.com/docs/plans/hobby) is for personal, non-commercial use.
 
 ## 1. Prepare
 
@@ -43,7 +43,18 @@ Only the configured owner can sign in. Missing owner configuration blocks login.
 2. Add [Neon from Vercel Marketplace](https://vercel.com/marketplace/neon) and connect a database. Copy **Neon → Connect → Connection pooling → Connection string** into Vercel **Settings → Environment Variables → Production → `DATABASE_URL`**.
 3. Add the remaining filled `.env.local` values to **Production**. Set `APP_URL=https://YOUR-PROJECT.vercel.app` (or your permanent custom domain), with no path/trailing slash. Keep secrets out of Git and preview deployments.
 4. Deploy/redeploy. Tables are created automatically. Keep the production domain publicly reachable; Meta cannot use pages behind Vercel login protection.
-5. In **Vercel → Settings → Cron Jobs**, confirm `/api/cron/maintenance` runs every five minutes.
+5. In **Vercel → Settings → Cron Jobs**, confirm `/api/cron/maintenance` runs **once daily**. This checks Instagram tokens and fits [Hobby's cron limit](https://vercel.com/docs/cron-jobs/usage-and-pricing).
+
+### Enable free recovery
+
+Normal replies run immediately when Instagram sends a webhook. Add this free job to recover queued replies after interruptions, even when the app is closed:
+
+1. Sign up at [cron-job.org](https://cron-job.org/en/) → **Create cronjob**.
+2. Set URL to `https://YOUR-PROJECT.vercel.app/api/cron/maintenance?background=1`, method **GET**, schedule **every 15 minutes**.
+3. Under **Advanced → Headers**, add `Authorization` with value `Bearer YOUR_CRON_SECRET`. Replace only `YOUR_CRON_SECRET` with the value from Vercel; keep `Bearer ` before it. Keep the secret out of the URL.
+4. Enable failure notifications, save, then **Test run**. Expect **202**: maintenance was accepted for background processing. Check InstaLoom's **Recent replies** for delivery and Vercel **Logs** for worker errors.
+
+The 15-minute interval lets an idle Neon database sleep between checks. Daily maintenance alone cannot reliably recover replies: queued work expires after one hour. Failed or uncertain sends are never retried automatically. The scheduler is [free and supports custom headers](https://cron-job.org/en/faq/); its success status confirms acceptance, not delivery.
 
 **Move existing data (optional):** stop the app, back up `data`, set an **empty** destination's `DATABASE_URL`, then run `yarn db:import data/chatplace.db` (or `data/instaloom.db`). Reconnect Instagram and enable your imported rules. The source stays unchanged; old sessions and pending sends are not resumed.
 

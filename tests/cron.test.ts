@@ -1,4 +1,4 @@
-import { NextRequest } from "next/server";
+import { after, NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GET } from "@/app/api/cron/maintenance/route";
 import { closeDb, getDb } from "@/lib/db";
@@ -8,18 +8,21 @@ import { processWebhook } from "@/lib/webhook";
 import { instagramMessage, resetDatabase, seedAccount } from "./helpers";
 import type { AutomationInput } from "@/lib/automations/schema";
 
+vi.mock("next/server", async (original) => ({ ...await original<typeof import("next/server")>(), after: vi.fn() }));
+
 const rule: AutomationInput = {
   name: "Price details", accountId: "account-1", channel: "dm", mediaId: "", enabled: true,
   matchAll: false, keywords: ["price"], publicReply: "", dmReply: "Here are the details.",
 };
 
-function cron(authorization: string | null = "Bearer local-cron-test-secret") {
-  return GET(new NextRequest("http://localhost:3000/api/cron/maintenance", {
+function cron(authorization: string | null = "Bearer local-cron-test-secret", background = false) {
+  return GET(new NextRequest(`http://localhost:3000/api/cron/maintenance${background ? "?background=1" : ""}`, {
     headers: authorization === null ? {} : { authorization },
   }));
 }
 
 beforeEach(async () => {
+  vi.mocked(after).mockClear();
   await resetDatabase();
   await seedAccount();
   vi.stubEnv("CRON_SECRET", "local-cron-test-secret");
@@ -31,14 +34,20 @@ describe("scheduled maintenance", () => {
   it.each([null, "Bearer wrong", "Basic local-cron-test-secret"])("requires the cron bearer secret (%s)", async (authorization) => {
     await saveRule(rule);
     await processWebhook(instagramMessage("queued", Date.now(), "price"));
-    expect((await cron(authorization)).status).toBe(401);
+    for (const background of [false, true]) {
+      expect((await cron(authorization, background)).status).toBe(401);
+    }
+    expect(after).not.toHaveBeenCalled();
     expect((await getRuns("account-1", "dm"))[0].status).toBe("queued");
     expect(fetch).not.toHaveBeenCalled();
   });
 
   it("fails closed when no cron secret is configured", async () => {
     vi.stubEnv("CRON_SECRET", "");
-    expect((await cron()).status).toBe(401);
+    for (const background of [false, true]) {
+      expect((await cron(undefined, background)).status).toBe(401);
+    }
+    expect(after).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -53,6 +62,38 @@ describe("scheduled maintenance", () => {
     expect((await getRuns("account-1", "dm"))[0].status).toBe("sent");
     expect((await cron()).status).toBe(200);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts external scheduler requests before delivery, then recovers queued replies in the background", async () => {
+    await saveRule(rule);
+    await processWebhook(instagramMessage("background-recover", Date.now(), "price"));
+    vi.mocked(fetch).mockResolvedValue(Response.json({ message_id: "background-sent" }));
+    const response = await cron(undefined, true);
+    expect(response.status).toBe(202);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({ accepted: true });
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await getRuns("account-1", "dm"))[0].status).toBe("queued");
+
+    const work = vi.mocked(after).mock.calls[0][0];
+    if (typeof work !== "function") throw new Error("Expected a background callback");
+    await work();
+    expect((await getRuns("account-1", "dm"))[0].status).toBe("sent");
+    // A daily Vercel invocation cannot resend the completed reply.
+    expect((await cron()).status).toBe(200);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs background failures without exposing private data or an unhandled rejection", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    expect((await cron(undefined, true)).status).toBe(202);
+    vi.spyOn(getDb(), "transaction").mockRejectedValue(new Error("private-worker-failure"));
+    const work = vi.mocked(after).mock.calls[0][0];
+    if (typeof work !== "function") throw new Error("Expected a background callback");
+    await expect(work()).resolves.toBeUndefined();
+    expect(console.error).toHaveBeenCalledExactlyOnceWith("Scheduled maintenance did not complete.");
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("marks interrupted sends unknown and never resends them", async () => {
@@ -94,9 +135,12 @@ describe("scheduled maintenance", () => {
   it("reports configuration failures without exposing credentials or queued content", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubEnv("OWNER_INSTAGRAM_ID", "");
-    const response = await cron();
-    expect(response.status).toBe(503);
-    expect(await response.json()).toEqual({ ok: false });
+    for (const background of [false, true]) {
+      const response = await cron(undefined, background);
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({ ok: false });
+    }
+    expect(after).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 });
