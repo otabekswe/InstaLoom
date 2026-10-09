@@ -25,7 +25,7 @@ export async function GET(request: NextRequest) {
       const config = getInstagramConfig();
       const token = await exchangeInstagramCode(code);
       const profile = await getInstagramIdentity(token.access_token);
-      if (profile.user_id !== ownerId) return settingsError("not_owner");
+      if (ownerId && profile.user_id !== ownerId) return settingsError("not_owner");
       const user = await resolveOAuthUser({ appId: config.appId, subject: profile.user_id, name: profile.name || profile.username }, flow.userId);
       await subscribeAccountWebhooks({ instagramAccountId: profile.user_id, accessToken: token.access_token });
       await linkInstagramAccount({

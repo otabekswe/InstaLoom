@@ -49,11 +49,17 @@ export function getInstagramConfig() {
   };
 }
 
-/** The canonical Instagram user_id returned by the authenticated Graph profile. */
-export function getOwnerInstagramId(): string {
-  const value = process.env.OWNER_INSTAGRAM_ID || "";
+/** Optional single-account restriction, using Graph's canonical Instagram user_id. */
+export function getOwnerInstagramId(): string | null {
+  const value = (process.env.OWNER_INSTAGRAM_ID || "").trim();
+  if (!value) return null;
   if (!/^\d+$/.test(value)) {
-    throw new OwnerConfigurationError("Set OWNER_INSTAGRAM_ID to your numeric Instagram user_id before connecting this private workspace.");
+    throw new OwnerConfigurationError("Set OWNER_INSTAGRAM_ID to a numeric Instagram user_id, or leave it empty to allow Meta-authorized accounts.");
   }
   return value;
+}
+
+export function isInstagramAccountAllowed(instagramAccountId: string): boolean {
+  const ownerId = getOwnerInstagramId();
+  return ownerId === null || instagramAccountId === ownerId;
 }

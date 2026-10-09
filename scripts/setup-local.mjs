@@ -28,4 +28,4 @@ if (additions.length || original !== existing) {
 }
 
 console.log("Local configuration is ready in .env.local. Existing values were preserved.");
-console.log("Add your Instagram credentials and app URL, then run yarn setup:owner to configure your private account.");
+console.log("Add your Instagram credentials and app URL. Leave OWNER_INSTAGRAM_ID empty for multiple accounts, or run yarn setup:owner to restrict sign-in to one account.");

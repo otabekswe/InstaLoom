@@ -77,7 +77,7 @@ describe("workspace sessions", () => {
 
   it("rejects expired and pre-owner sessions", async () => {
     const token = await signIn();
-    for (const version of ["legacy-credential-hash", "instagram-login:123456789"]) {
+    for (const version of ["legacy-credential-hash", "instagram-login:123456789", "owner-instagram:v1:123456789:200"]) {
       const response = NextResponse.json({});
       await createSession({ id: "default", name: "Test owner" }, request("/"), response);
       await getDb().prepare("UPDATE auth_sessions SET auth_version = ?").run(version);
@@ -115,6 +115,23 @@ describe("workspace sessions", () => {
     await expect(createSession({ id: "another-user", name: "Other" }, request("/"), response)).rejects.toMatchObject({ status: 403 });
     expect(response.cookies.get(SESSION_COOKIE)).toBeUndefined();
     expect(await getDb().prepare("SELECT count(*) AS n FROM auth_sessions").get()).toEqual({ n: 0 });
+  });
+
+  it("requires a current-app identity when multiple accounts are allowed", async () => {
+    vi.stubEnv("OWNER_INSTAGRAM_ID", "");
+    const token = await signIn();
+    await getDb().prepare("UPDATE instagram_identities SET app_id = 'another-app'").run();
+    expect((await session(request("/api/auth/session", { cookie: token }))).status).toBe(401);
+    const response = NextResponse.json({});
+    await expect(createSession({ id: "default", name: "Other app user" }, request("/"), response)).rejects.toMatchObject({ status: 403 });
+    expect(response.cookies.get(SESSION_COOKIE)).toBeUndefined();
+  });
+
+  it("invalidates multi-account sessions when the owner restriction is enabled", async () => {
+    vi.stubEnv("OWNER_INSTAGRAM_ID", "");
+    const token = await signIn();
+    vi.stubEnv("OWNER_INSTAGRAM_ID", "200");
+    expect((await session(request("/api/auth/session", { cookie: token }))).status).toBe(401);
   });
 });
 
@@ -300,10 +317,10 @@ describe("Instagram OAuth sign-in", () => {
     }
   });
 
-  it.each(["test", "production"])("requires an explicitly configured owner in %s before starting authorization", async (environment) => {
+  it.each(["test", "production"])("rejects a malformed owner restriction in %s before starting authorization", async (environment) => {
     vi.stubEnv("NODE_ENV", environment);
     const fetchMock = vi.spyOn(globalThis, "fetch");
-    for (const owner of ["", "studio", "200,222"]) {
+    for (const owner of ["studio", "200,222"]) {
       vi.stubEnv("OWNER_INSTAGRAM_ID", owner);
       const response = await startOAuth(request("/api/auth/instagram"));
       expect(response.status).toBe(503);
@@ -314,15 +331,80 @@ describe("Instagram OAuth sign-in", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not authorize an in-flight callback after owner configuration is removed", async () => {
+  it.each([
+    ["OWNER_INSTAGRAM_ID", ""],
+    ["OWNER_INSTAGRAM_ID", "222"],
+    ["OWNER_INSTAGRAM_ID", "invalid"],
+    ["INSTAGRAM_APP_ID", "987654321"],
+  ])("rejects an in-flight callback after %s changes to %s", async (key, value) => {
     const flow = await begin();
-    vi.stubEnv("OWNER_INSTAGRAM_ID", "");
+    vi.stubEnv(key, value);
     const fetchMock = vi.spyOn(globalThis, "fetch");
     const response = await finish(flow);
-    expect(response.headers.get("location")).toContain("error=owner_not_configured");
+    expect(response.headers.get("location")).toContain("error=invalid_state");
     expect(response.cookies.get(SESSION_COOKIE)).toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(await getDb().prepare("SELECT count(*) AS n FROM users").get()).toEqual({ n: 0 });
+  });
+
+  it("gives separate Meta-authorized accounts isolated sessions and account lists", async () => {
+    vi.stubEnv("OWNER_INSTAGRAM_ID", "");
+    const firstFetch = mockMeta("200");
+    const first = await finish(await begin());
+    expect(first.headers.get("location")).toContain("/inbox?connected=1");
+    firstFetch.mockRestore();
+    mockMeta("222");
+    const second = await finish(await begin());
+    expect(second.headers.get("location")).toContain("/inbox?connected=1");
+    const firstCookie = cookie(first);
+    const secondCookie = cookie(second);
+    const firstUser = (await (await session(request("/api/auth/session", { cookie: firstCookie }))).json()).user;
+    const secondUser = (await (await session(request("/api/auth/session", { cookie: secondCookie }))).json()).user;
+    expect(firstUser.id).not.toBe(secondUser.id);
+    const firstAccounts = (await (await accounts(request(`/api/accounts?user_id=${secondUser.id}`, { cookie: firstCookie }))).json()).accounts;
+    const secondAccounts = (await (await accounts(request(`/api/accounts?user_id=${firstUser.id}`, { cookie: secondCookie }))).json()).accounts;
+    expect(firstAccounts).toHaveLength(1);
+    expect(secondAccounts).toHaveLength(1);
+    expect(firstAccounts[0].instagramAccountId).toBe("200");
+    expect(secondAccounts[0].instagramAccountId).toBe("222");
+    expect(JSON.stringify([firstAccounts, secondAccounts])).not.toContain("fake-instagram-token");
+    expect(await getDb().prepare("SELECT count(*) AS n FROM instagram_identities").get()).toEqual({ n: 2 });
+    expect(await getDb().prepare("SELECT count(*) AS n FROM auth_sessions").get()).toEqual({ n: 2 });
+    const repeat = await finish(await begin());
+    expect((await (await session(request("/api/auth/session", { cookie: cookie(repeat) }))).json()).user.id).toBe(secondUser.id);
+  });
+
+  it.each([false, true])("does not attach a different account during reconnect (existing account: %s)", async (existingAccount) => {
+    vi.stubEnv("OWNER_INSTAGRAM_ID", "");
+    const firstFetch = mockMeta("200");
+    const first = await finish(await begin());
+    const firstToken = cookie(first);
+    firstFetch.mockRestore();
+    const otherFetch = mockMeta("222");
+    if (existingAccount) await finish(await begin());
+    otherFetch.mockClear();
+    const reconnect = await finish(await begin(firstToken));
+    expect(reconnect.headers.get("location")).toBe("http://localhost:3000/settings?error=account_mismatch");
+    expect(reconnect.cookies.get(SESSION_COOKIE)).toBeUndefined();
+    expect(otherFetch).toHaveBeenCalledTimes(3);
+    expect((await session(request("/api/auth/session", { cookie: firstToken }))).status).toBe(200);
+    for (const table of ["users", "instagram_identities", "instagram_accounts", "auth_sessions"]) {
+      expect(await getDb().prepare(`SELECT count(*) AS n FROM ${table}`).get()).toEqual({ n: existingAccount ? 2 : 1 });
+    }
+    const ownAccounts = (await (await accounts(request("/api/accounts", { cookie: firstToken }))).json()).accounts;
+    expect(ownAccounts.map((account: { instagramAccountId: string }) => account.instagramAccountId)).toEqual(["200"]);
+  });
+
+  it("rotates a session for a same-account reconnect without an owner restriction", async () => {
+    vi.stubEnv("OWNER_INSTAGRAM_ID", "");
+    mockMeta("222");
+    const first = await finish(await begin());
+    const second = await finish(await begin(cookie(first)));
+    expect(second.headers.get("location")).toContain("/inbox?connected=1");
+    expect((await session(request("/api/auth/session", { cookie: cookie(first) }))).status).toBe(401);
+    expect((await session(request("/api/auth/session", { cookie: cookie(second) }))).status).toBe(200);
+    expect(await getDb().prepare("SELECT count(*) AS n FROM users").get()).toEqual({ n: 1 });
+    expect(await getDb().prepare("SELECT count(*) AS n FROM instagram_accounts").get()).toEqual({ n: 1 });
   });
 
   it("reuses the same workspace and preserves only verified legacy Instagram data", async () => {

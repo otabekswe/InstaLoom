@@ -24,7 +24,7 @@ function digest(value: string): string {
 }
 
 function authVersion(): string {
-  return `owner-instagram:v1:${process.env.INSTAGRAM_APP_ID || ""}:${getOwnerInstagramId()}`;
+  return `instagram-login:v2:${process.env.INSTAGRAM_APP_ID || ""}:${getOwnerInstagramId() ?? "all"}`;
 }
 
 export async function getSession(request: NextRequest): Promise<AuthSession | null> {
@@ -33,8 +33,9 @@ export async function getSession(request: NextRequest): Promise<AuthSession | nu
 
 export async function getSessionFromToken(token: string | undefined): Promise<AuthSession | null> {
   if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
-  let ownerId: string;
-  try { ownerId = getOwnerInstagramId(); }
+  let ownerId: string | null;
+  let version: string;
+  try { ownerId = getOwnerInstagramId(); version = authVersion(); }
   catch (error) {
     if (error instanceof ConfigurationError) return null;
     throw error;
@@ -42,13 +43,13 @@ export async function getSessionFromToken(token: string | undefined): Promise<Au
   const db = getDb();
   const tokenHash = digest(token);
   const session = await db.prepare(`SELECT s.user_id, s.auth_version, s.expires_at, u.name,
-    EXISTS (SELECT 1 FROM instagram_identities i WHERE i.user_id = s.user_id AND i.app_id = ? AND i.subject = ?) AS is_owner
+    EXISTS (SELECT 1 FROM instagram_identities i WHERE i.user_id = s.user_id AND i.app_id = ? ${ownerId ? "AND i.subject = ?" : ""}) AS has_identity
     FROM auth_sessions s JOIN users u ON u.id = s.user_id WHERE token_hash = ?`
-  ).get(process.env.INSTAGRAM_APP_ID || "", ownerId, tokenHash) as {
-    user_id: string; auth_version: string; expires_at: number; name: string | null; is_owner: number | boolean;
+  ).get(process.env.INSTAGRAM_APP_ID || "", ...(ownerId ? [ownerId] : []), tokenHash) as {
+    user_id: string; auth_version: string; expires_at: number; name: string | null; has_identity: number | boolean;
   } | undefined;
   if (!session) return null;
-  if (session.expires_at <= Date.now() || session.auth_version !== authVersion() || !session.is_owner) {
+  if (session.expires_at <= Date.now() || session.auth_version !== version || !session.has_identity) {
     await db.prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(tokenHash);
     return null;
   }
@@ -77,17 +78,18 @@ export function sessionCookieOptions() {
 
 /** Only call after retrieving the identity from Meta with the exchanged user token. */
 export async function resolveOAuthUser(identity: { appId: string; subject: string; name: string }, workspaceUserId?: string | null): Promise<AuthUser> {
-  if (identity.subject !== getOwnerInstagramId() || identity.appId !== process.env.INSTAGRAM_APP_ID) {
+  const ownerId = getOwnerInstagramId();
+  if ((ownerId && identity.subject !== ownerId) || identity.appId !== process.env.INSTAGRAM_APP_ID) {
     throw new ApiError(403, "This workspace is private. Sign in with its configured Instagram owner account.");
   }
   const db = getDb();
   return db.transaction(async () => {
     const existing = await db.prepare("SELECT user_id FROM instagram_identities WHERE app_id = ? AND subject = ?")
       .get(identity.appId, identity.subject) as { user_id: string } | undefined;
-    if (existing && workspaceUserId && existing.user_id !== workspaceUserId) {
-      throw new ApiError(409, "This Instagram account belongs to another workspace.");
+    if (workspaceUserId && existing?.user_id !== workspaceUserId) {
+      throw new ApiError(409, "Sign out before connecting a different Instagram account.");
     }
-    const id = existing?.user_id ?? workspaceUserId ?? randomUUID();
+    const id = existing?.user_id ?? randomUUID();
     const name = identity.name.trim().slice(0, 200) || "Instagram account";
     if (existing && !workspaceUserId) {
       await db.prepare("UPDATE users SET name = ?, updated_at = datetime('now') WHERE id = ?").run(name, id);
@@ -104,12 +106,13 @@ export async function resolveOAuthUser(identity: { appId: string; subject: strin
 
 export async function createSession(user: AuthUser, request: NextRequest, response: NextResponse): Promise<void> {
   const version = authVersion();
+  const ownerId = getOwnerInstagramId();
   const token = randomBytes(32).toString("base64url");
   const db = getDb();
   await db.transaction(async () => {
-    const owner = await db.prepare("SELECT user_id FROM instagram_identities WHERE app_id = ? AND subject = ? AND user_id = ?")
-      .get(process.env.INSTAGRAM_APP_ID || "", getOwnerInstagramId(), user.id);
-    if (!owner) throw new ApiError(403, "Only the configured Instagram owner can access this workspace.");
+    const identity = await db.prepare(`SELECT user_id FROM instagram_identities WHERE app_id = ? AND user_id = ? ${ownerId ? "AND subject = ?" : ""}`)
+      .get(process.env.INSTAGRAM_APP_ID || "", user.id, ...(ownerId ? [ownerId] : []));
+    if (!identity) throw new ApiError(403, "Connect an authorized Instagram account to access this workspace.");
     await db.prepare("DELETE FROM auth_sessions WHERE expires_at <= ?").run(Date.now());
     const previous = request.cookies.get(SESSION_COOKIE)?.value;
     if (previous) await db.prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(digest(previous));
@@ -134,7 +137,7 @@ export async function revokeSession(request: NextRequest): Promise<NextResponse>
 }
 
 export async function createOAuthState(request: NextRequest, response: NextResponse): Promise<string> {
-  getOwnerInstagramId();
+  const version = authVersion();
   const db = getDb();
   const state = randomBytes(32).toString("base64url");
   const browser = randomBytes(32).toString("base64url");
@@ -144,7 +147,7 @@ export async function createOAuthState(request: NextRequest, response: NextRespo
     await db.prepare("DELETE FROM oauth_flows WHERE expires_at <= ?").run(Date.now());
     if (previous) await db.prepare("DELETE FROM oauth_flows WHERE browser_hash = ?").run(digest(previous));
     await db.prepare("INSERT INTO oauth_flows (state_hash, browser_hash, session_hash, expires_at) VALUES (?, ?, ?, ?)")
-      .run(digest(state), digest(browser), session?.tokenHash ?? null, Date.now() + OAUTH_SECONDS * 1000);
+      .run(digest(`${version}:${state}`), digest(browser), session?.tokenHash ?? null, Date.now() + OAUTH_SECONDS * 1000);
   })();
   response.cookies.set(OAUTH_COOKIE, browser, { ...sessionCookieOptions(), path: "/api/auth/instagram", maxAge: OAUTH_SECONDS });
   return state;
@@ -154,10 +157,16 @@ export async function consumeOAuthState(request: NextRequest): Promise<{ userId:
   const state = request.nextUrl.searchParams.get("state");
   const browser = request.cookies.get(OAUTH_COOKIE)?.value;
   if (!state || !browser || !/^[A-Za-z0-9_-]{43}$/.test(state) || !/^[A-Za-z0-9_-]{43}$/.test(browser)) return null;
+  let version: string;
+  try { version = authVersion(); }
+  catch (error) {
+    if (error instanceof ConfigurationError) return null;
+    throw error;
+  }
   const db = getDb();
   return db.transaction(async () => {
     const flow = await db.prepare(`DELETE FROM oauth_flows WHERE state_hash = ? AND browser_hash = ? AND expires_at > ?
-      RETURNING session_hash`).get(digest(state), digest(browser), Date.now()) as { session_hash: string | null } | undefined;
+      RETURNING session_hash`).get(digest(`${version}:${state}`), digest(browser), Date.now()) as { session_hash: string | null } | undefined;
     if (!flow) return null;
     const session = await getSession(request);
     if (flow.session_hash !== (session?.tokenHash ?? null)) return null;

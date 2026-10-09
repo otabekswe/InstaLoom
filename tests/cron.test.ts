@@ -132,9 +132,42 @@ describe("scheduled maintenance", () => {
     expect((await getAccountById("account-1"))?.accessToken).toBe("refreshed-private-token");
   });
 
+  it("refreshes every verified workspace while skipping expired and foreign-app connections", async () => {
+    vi.stubEnv("OWNER_INSTAGRAM_ID", "");
+    for (const [userId, accountId, subject, appId] of [
+      ["tester", "tester-account", "222", "123456789"],
+      ["foreign", "foreign-account", "333", "other-app"],
+    ]) {
+      await seedAccount(userId, accountId);
+      await getDb().prepare("UPDATE instagram_accounts SET instagram_account_id = ?, access_token = ? WHERE id = ?")
+        .run(subject, `token-${subject}`, accountId);
+      await getDb().prepare("INSERT INTO instagram_identities(app_id,subject,user_id) VALUES(?,?,?)")
+        .run(appId, subject, userId);
+    }
+    await getDb().prepare("UPDATE instagram_accounts SET token_expires_at=?,token_refreshed_at=?")
+      .run(Date.now() + 86400_000, Date.now() - 30 * 86400_000);
+    vi.mocked(fetch).mockImplementation(async (url) => Response.json({
+      access_token: `${new URL(String(url)).searchParams.get("access_token")}-renewed`, expires_in: 60 * 86400,
+    }));
+    expect((await cron()).status).toBe(200);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect((await getAccountById("account-1"))?.accessToken).toBe("private-test-token-renewed");
+    expect((await getAccountById("tester-account"))?.accessToken).toBe("token-222-renewed");
+    expect(await getDb().prepare("SELECT access_token FROM instagram_accounts WHERE id = ?").get("foreign-account"))
+      .toEqual({ access_token: "token-333" });
+
+    vi.mocked(fetch).mockClear();
+    await getDb().prepare("UPDATE instagram_accounts SET token_expires_at = ? WHERE id = ?").run(Date.now() - 1, "account-1");
+    await getDb().prepare("UPDATE instagram_accounts SET token_expires_at=?,token_refreshed_at=?,token_refresh_attempted_at=0 WHERE id=?")
+      .run(Date.now() + 86400_000, Date.now() - 30 * 86400_000, "tester-account");
+    expect((await cron()).status).toBe(200);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect((await getAccountById("tester-account"))?.accessToken).toBe("token-222-renewed-renewed");
+  });
+
   it("reports configuration failures without exposing credentials or queued content", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    vi.stubEnv("OWNER_INSTAGRAM_ID", "");
+    vi.stubEnv("OWNER_INSTAGRAM_ID", "invalid-id");
     for (const background of [false, true]) {
       const response = await cron(undefined, background);
       expect(response.status).toBe(503);

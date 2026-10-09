@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getDb } from "@/lib/db";
-import { getOwnerInstagramId } from "@/lib/config";
+import { instagramAccountScope } from "@/lib/instagram/account-scope";
 import type { AutomationInput, AutomationRule, AutomationChannel, AutomationRun } from "./schema";
 
 type RuleRow = {
@@ -112,8 +112,9 @@ export async function enqueueAutomation(event: AutomationEvent): Promise<void> {
   await db.transaction(async () => {
     const now = Date.now();
     if (event.timestamp < now - 3600_000 || event.timestamp > now + 300_000) return;
-    if (!await db.prepare("SELECT 1 FROM instagram_accounts WHERE id = ? AND instagram_account_id = ? AND is_active = 1")
-      .get(event.accountId, getOwnerInstagramId())) return;
+    const scope = instagramAccountScope("i");
+    if (!await db.prepare(`SELECT 1 FROM instagram_accounts i WHERE i.id = ? AND i.is_active = 1 AND ${scope.sql}`)
+      .get(event.accountId, ...scope.params)) return;
     // Choose a match before cooldown: never fall through to a second rule.
     const rule = (await getRules(event.accountId, event.channel)).find((item) => item.enabled
       && item.mediaId === (event.mediaId ?? "")

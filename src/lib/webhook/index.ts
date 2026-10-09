@@ -3,7 +3,6 @@ import { enqueueAutomation } from "@/lib/automations/store";
 import { z } from "zod";
 import type { InstagramAccount, WebhookEvent, WebhookMessaging, WebhookChange, MessageType } from "@/types";
 import { getDb, first, run } from "@/lib/db";
-import { getOwnerInstagramId } from "@/lib/config";
 import {
   upsertConversation, recordMessage, getConversationByPsid, getConversationById,
   getAccountById, getAccountAccessToken, getAccountsForWebhook, markOutboundMessagesRead,
@@ -182,7 +181,7 @@ async function sendAgentReplyOnce(params: {
   const conversation = await getConversationById(params.conversationId);
   if (!conversation || conversation.instagramAccountId !== params.accountId) throw new Error("Conversation not found");
   const account = await getAccountById(params.accountId);
-  if (!account?.isActive || account.instagramAccountId !== getOwnerInstagramId()) throw new Error("Account not found or inactive");
+  if (!account?.isActive) throw new Error("Account not found or inactive");
   if (!account.tokenExpiresAt || account.tokenExpiresAt <= Date.now() || !account.accessToken) {
     throw new ReplyEligibilityError("Reconnect this Instagram account in Settings to send replies.");
   }

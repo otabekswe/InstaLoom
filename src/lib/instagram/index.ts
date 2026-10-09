@@ -1,11 +1,12 @@
 import { z } from "zod";
 import { getDb, all, first, run } from "@/lib/db";
-import { getOwnerInstagramId } from "@/lib/config";
+import { isInstagramAccountAllowed } from "@/lib/config";
 import { mapAccount, mapConversation, mapMessage, type AccountRow, type ConversationRow, type MessageRow } from "@/lib/db/mappers";
 import type { InstagramAccount, PublicInstagramAccount, Conversation, Message, MessageDirection, MessageType } from "@/types";
 
 import { graphRequest } from "./client";
 import { refreshInstagramToken } from "./oauth";
+import { instagramAccountScope } from "./account-scope";
 export { getGraphApiVersion } from "./client";
 
 export function toPublicAccount(account: InstagramAccount): PublicInstagramAccount {
@@ -23,8 +24,11 @@ export async function linkInstagramAccount(params: {
   userId: string; instagramAccountId: string; accessToken: string; expiresIn: number;
   displayName: string; username: string; profilePic?: string; claimLegacyAccount?: boolean;
 }): Promise<InstagramAccount> {
-  requireOwnerAccount(params.instagramAccountId);
+  requireAllowedAccount(params.instagramAccountId);
   return getDb().transaction(async () => {
+    const identity = await first("SELECT 1 FROM instagram_identities WHERE app_id = ? AND subject = ? AND user_id = ?",
+      process.env.INSTAGRAM_APP_ID || "", params.instagramAccountId, params.userId);
+    if (!identity) throw new Error("This Instagram account is not authorized for this workspace.");
     let existing = await first<AccountRow>(
       "SELECT * FROM instagram_accounts WHERE user_id = ? AND instagram_account_id = ?",
       params.userId, params.instagramAccountId,
@@ -60,21 +64,24 @@ export async function linkInstagramAccount(params: {
 }
 
 export async function getAccountsByUser(userId: string): Promise<InstagramAccount[]> {
-  return (await all<AccountRow>("SELECT * FROM instagram_accounts WHERE user_id = ? AND instagram_account_id = ? ORDER BY connected_at DESC, id DESC", userId, getOwnerInstagramId())).map(mapAccount);
+  const scope = instagramAccountScope("i");
+  return (await all<AccountRow>(`SELECT i.* FROM instagram_accounts i WHERE i.user_id = ? AND ${scope.sql} ORDER BY i.connected_at DESC, i.id DESC`, userId, ...scope.params)).map(mapAccount);
 }
 
 export async function getAccountById(accountId: string): Promise<InstagramAccount | undefined> {
-  const row = await first<AccountRow>("SELECT * FROM instagram_accounts WHERE id = ? AND instagram_account_id = ?", accountId, getOwnerInstagramId());
+  const scope = instagramAccountScope("i");
+  const row = await first<AccountRow>(`SELECT i.* FROM instagram_accounts i WHERE i.id = ? AND ${scope.sql}`, accountId, ...scope.params);
   return row ? mapAccount(row) : undefined;
 }
 
 export async function getAccountsForWebhook(entryId: string): Promise<InstagramAccount[]> {
-  if (entryId !== getOwnerInstagramId()) return [];
-  return (await all<AccountRow>("SELECT * FROM instagram_accounts WHERE instagram_account_id = ? AND is_active = 1 AND access_token != ''", entryId)).map(mapAccount);
+  const scope = instagramAccountScope("i");
+  return (await all<AccountRow>(`SELECT i.* FROM instagram_accounts i WHERE i.instagram_account_id = ? AND i.is_active = 1 AND i.access_token != '' AND ${scope.sql}`, entryId, ...scope.params)).map(mapAccount);
 }
 
 export async function disconnectAccount(accountId: string, userId: string): Promise<boolean> {
-  return (await run("UPDATE instagram_accounts SET is_active = 0, access_token = '', updated_at = datetime('now') WHERE id = ? AND user_id = ? AND instagram_account_id = ?", accountId, userId, getOwnerInstagramId())).changes > 0;
+  const scope = instagramAccountScope("instagram_accounts");
+  return (await run(`UPDATE instagram_accounts SET is_active = 0, access_token = '', updated_at = datetime('now') WHERE id = ? AND user_id = ? AND ${scope.sql}`, accountId, userId, ...scope.params)).changes > 0;
 }
 
 const refreshing = new Map<string, Promise<string>>();
@@ -93,7 +100,7 @@ export async function getAccountAccessToken(accountId: string): Promise<string> 
 async function refreshAccountToken(accountId: string): Promise<string> {
   const account = await getAccountById(accountId);
   const now = Date.now();
-  if (!account?.isActive || account.instagramAccountId !== getOwnerInstagramId() || !account.accessToken || !account.tokenExpiresAt || account.tokenExpiresAt <= now) {
+  if (!account?.isActive || !account.accessToken || !account.tokenExpiresAt || account.tokenExpiresAt <= now) {
     throw new Error("Reconnect this Instagram account in Settings to continue.");
   }
   if (account.tokenExpiresAt - now <= 7 * DAY_MS && account.tokenRefreshedAt && now - account.tokenRefreshedAt >= DAY_MS) {
@@ -111,7 +118,7 @@ async function refreshAccountToken(accountId: string): Promise<string> {
     }
   }
   const latest = await getAccountById(accountId);
-  if (!latest?.isActive || latest.instagramAccountId !== getOwnerInstagramId() || !latest.accessToken || !latest.tokenExpiresAt || latest.tokenExpiresAt <= Date.now()) {
+  if (!latest?.isActive || !latest.accessToken || !latest.tokenExpiresAt || latest.tokenExpiresAt <= Date.now()) {
     throw new Error("Reconnect this Instagram account in Settings to continue.");
   }
   return latest.accessToken;
@@ -270,8 +277,8 @@ export async function getCustomerProfile(accessToken: string, psid: string): Pro
   } catch { return null; }
 }
 
-function requireOwnerAccount(instagramAccountId: string): void {
-  if (instagramAccountId !== getOwnerInstagramId()) throw new Error("This Instagram account is not authorized for this workspace.");
+function requireAllowedAccount(instagramAccountId: string): void {
+  if (!isInstagramAccountAllowed(instagramAccountId)) throw new Error("This Instagram account is not authorized for this workspace.");
 }
 
 const sentMessageSchema = z.object({ recipient_id: nonempty.optional(), message_id: nonempty });
@@ -289,7 +296,7 @@ function messageContent(params: SendContent): Record<string, unknown> {
 export async function sendMessage(params: SendContent & {
   instagramAccountId: string; accessToken: string; recipientPsid: string;
 }): Promise<{ recipientId: string; messageId: string }> {
-  requireOwnerAccount(params.instagramAccountId);
+  requireAllowedAccount(params.instagramAccountId);
   const data = await graphRequest(`${encodeURIComponent(params.instagramAccountId)}/messages`, params.accessToken, sentMessageSchema,
     { body: { recipient: { id: params.recipientPsid }, message: messageContent(params) } });
   return { recipientId: data.recipient_id ?? params.recipientPsid, messageId: data.message_id };
@@ -298,14 +305,14 @@ export async function sendMessage(params: SendContent & {
 export async function sendPrivateReply(params: SendContent & {
   instagramAccountId: string; accessToken: string; commentId: string;
 }): Promise<{ id: string; messageId: string; recipientId?: string }> {
-  requireOwnerAccount(params.instagramAccountId);
+  requireAllowedAccount(params.instagramAccountId);
   const data = await graphRequest(`${encodeURIComponent(params.instagramAccountId)}/messages`, params.accessToken, sentMessageSchema,
     { body: { recipient: { comment_id: params.commentId }, message: messageContent(params) } });
   return { id: data.message_id, messageId: data.message_id, recipientId: data.recipient_id };
 }
 
 export async function subscribeAccountWebhooks(params: { instagramAccountId: string; accessToken: string }): Promise<void> {
-  requireOwnerAccount(params.instagramAccountId);
+  requireAllowedAccount(params.instagramAccountId);
   // Subscribe this Instagram professional account directly after OAuth.
   await graphRequest(`${encodeURIComponent(params.instagramAccountId)}/subscribed_apps`, params.accessToken,
     z.object({ success: z.literal(true) }),
